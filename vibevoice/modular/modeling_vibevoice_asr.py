@@ -332,6 +332,8 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
             
             # Combine acoustic and semantic features
             if speech_masks is not None:
+                if speech_masks.device != acoustic_features.device:
+                    speech_masks = speech_masks.to(acoustic_features.device)
                 combined_features = acoustic_features[speech_masks] + semantic_features[speech_masks]
             else:
                 combined_features = acoustic_features + semantic_features
@@ -379,6 +381,10 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
             )
             # Clone to avoid in-place operation on leaf variable during training
             inputs_embeds = inputs_embeds.clone()
+            if acoustic_input_mask.device != inputs_embeds.device:
+                acoustic_input_mask = acoustic_input_mask.to(inputs_embeds.device)
+            if speech_features.device != inputs_embeds.device:
+                speech_features = speech_features.to(inputs_embeds.device)
             inputs_embeds[acoustic_input_mask] = speech_features
 
         # Forward through the model
