@@ -8,6 +8,8 @@ The plugin is automatically loaded by vLLM via the 'vllm.general_plugins'
 entry point defined in pyproject.toml.
 """
 
+import os
+
 from vllm.model_executor.models import ModelRegistry
 from transformers import AutoConfig, AutoTokenizer, Qwen2Tokenizer, AutoProcessor, Qwen2AudioProcessor
 
@@ -15,6 +17,29 @@ from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceASRTextTokenizerFast
 
 from .model import VibeVoiceForCausalLM
+
+
+def _patch_torch_sdpa_backend():
+    backend = os.getenv("VLLM_ATTENTION_BACKEND", "").strip().upper()
+    if backend != "TORCH_SDPA":
+        return
+
+    try:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+    except Exception:
+        return
+
+    preferred = os.getenv("VIBEVOICE_TORCH_SDPA_COMPAT_BACKEND", "TRITON_ATTN").strip().upper()
+    if preferred not in AttentionBackendEnum.__members__ or preferred == "TORCH_SDPA":
+        preferred = "TRITON_ATTN"
+
+    preferred_backend = AttentionBackendEnum[preferred]
+    if not preferred_backend.value:
+        preferred_backend = AttentionBackendEnum.TRITON_ATTN
+        if not preferred_backend.value:
+            return
+
+    register_backend(AttentionBackendEnum.TORCH_SDPA, preferred_backend.value)
 
 
 def register_vibevoice():
@@ -27,7 +52,8 @@ def register_vibevoice():
     - Qwen2AudioProcessor with AutoProcessor
     - VibeVoiceForCausalLM with vLLM ModelRegistry
     """
-    # Register the configuration class with transformers
+    _patch_torch_sdpa_backend()
+
     AutoConfig.register("vibevoice", VibeVoiceConfig)
 
     # Register the tokenizer with transformers.

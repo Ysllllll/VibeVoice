@@ -22,6 +22,7 @@ import base64
 
 from vibevoice.processor.audio_utils import load_audio_use_ffmpeg, load_audio_bytes_use_ffmpeg, AudioNormalizer
 
+import tempfile
 
 def _ffmpeg_load_bytes(data: bytes) -> tuple[np.ndarray, int]:
     """Load audio bytes using FFmpeg via stdin-pipe decoding.
@@ -30,17 +31,16 @@ def _ffmpeg_load_bytes(data: bytes) -> tuple[np.ndarray, int]:
         Tuple of (audio_waveform, sample_rate). Sample rate is always 24000.
     """
     audio, sr = load_audio_bytes_use_ffmpeg(data, resample=True, target_sr=24000)
-    normalizer = AudioNormalizer()
-    audio = normalizer(audio)
-    return audio, sr
-
-def _ffmpeg_load_file(filepath) -> tuple[np.ndarray, int]:
-    """Load audio file using FFmpeg.
-    
-    Returns:
-        Tuple of (audio_waveform, sample_rate). Sample rate is always 24000.
-    """
-    audio, sr = load_audio_use_ffmpeg(str(filepath), resample=True, target_sr=24000)
+    if audio.size == 0:
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+                f.write(data)
+                tmp_path = f.name
+            audio, sr = load_audio_use_ffmpeg(tmp_path, resample=True, target_sr=24000)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
     normalizer = AudioNormalizer()
     audio = normalizer(audio)
     return audio, sr
