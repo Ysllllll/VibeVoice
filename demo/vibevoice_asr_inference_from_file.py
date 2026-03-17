@@ -15,7 +15,7 @@ import argparse
 import time
 import json
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from functools import wraps
 
 from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
@@ -120,7 +120,7 @@ class VibeVoiceASRBatchInference:
         """
         if len(audio_inputs) == 0:
             return []
-        
+
         batch_size = len(audio_inputs)
         print(f"\nProcessing batch of {batch_size} audio(s)...")
         
@@ -248,10 +248,208 @@ class VibeVoiceASRBatchInference:
         
         return all_results
 
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
+
+    def _shift_segments(self, segments: List[Dict[str, Any]], offset: float) -> List[Dict[str, Any]]:
+        shifted = []
+        for seg in segments:
+            curr = dict(seg)
+            for key in ["start_time", "end_time", "start", "end"]:
+                if key in curr:
+                    numeric = self._safe_float(curr[key])
+                    if numeric is not None:
+                        curr[key] = numeric + offset
+            shifted.append(curr)
+        return shifted
+
+    def transcribe_with_vad(
+        self,
+        audio_inputs: List,
+        vad_runner,
+        batch_size: int = 4,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        num_beams: int = 1,
+    ) -> List[Dict[str, Any]]:
+        all_results = []
+        for i, audio_input in enumerate(audio_inputs):
+            if isinstance(audio_input, str):
+                file_name = audio_input
+                audio_data = vad_runner._load_audio(audio_input)
+            elif isinstance(audio_input, dict) and "array" in audio_input:
+                file_name = audio_input.get("id", f"dataset_audio_{i}")
+                audio_data = audio_input["array"]
+            else:
+                file_name = f"audio_{i}"
+                audio_data = audio_input
+
+            vad_segments = vad_runner.detect(audio_input if isinstance(audio_input, str) else audio_data)
+            if not vad_segments:
+                all_results.append(
+                    {
+                        "file": file_name,
+                        "raw_text": "",
+                        "segments": [],
+                        "generation_time": 0.0,
+                        "vad_segments": [],
+                        "chunks": [],
+                    }
+                )
+                continue
+
+            chunk_inputs = []
+            for seg in vad_segments:
+                f1 = int(seg["start"] * vad_runner._sample_rate)
+                f2 = int(seg["end"] * vad_runner._sample_rate)
+                # chunk_inputs.append((audio_data[f1:f2], vad_runner._sample_rate))
+                chunk_inputs.append(audio_data[f1:f2])
+
+            chunk_results = self.transcribe_with_batching(
+                chunk_inputs,
+                batch_size=batch_size,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=do_sample,
+                num_beams=num_beams,
+            )
+
+            merged_text_parts = []
+            merged_segments = []
+            merged_chunks = []
+            generation_time = 0.0
+            import pdb;pdb.set_trace()
+            for idx, chunk_result in enumerate(chunk_results):
+                seg_meta = vad_segments[idx]
+                start_offset = float(seg_meta["start"])
+                shifted_segments = self._shift_segments(chunk_result.get("segments", []), start_offset)
+                merged_segments.extend(shifted_segments)
+                raw_text = chunk_result.get("raw_text", "")
+                if raw_text:
+                    merged_text_parts.append(raw_text)
+                generation_time += float(chunk_result.get("generation_time", 0.0))
+                merged_chunks.append(
+                    {
+                        "start": seg_meta["start"],
+                        "end": seg_meta["end"],
+                        "raw_text": raw_text,
+                        "segments": shifted_segments,
+                    }
+                )
+
+            all_results.append(
+                {
+                    "file": file_name,
+                    "raw_text": "\n".join(merged_text_parts),
+                    "segments": merged_segments,
+                    "generation_time": generation_time,
+                    "vad_segments": vad_segments,
+                    "chunks": merged_chunks,
+                }
+            )
+        return all_results
+
+
+class WhisperXPhase1VAD:
+    def __init__(
+        self,
+        vad_method: str = "pyannote",
+        vad_onset: float = 0.500,
+        vad_offset: float = 0.363,
+        chunk_size: int = 30,
+        device: str = "cpu",
+        device_index: int = 1,
+    ):
+        from whisperx.audio import load_audio, SAMPLE_RATE
+        from whisperx.vads import Vad, Pyannote, Silero
+
+        self._load_audio = load_audio
+        self._sample_rate = SAMPLE_RATE
+        self._Vad = Vad
+        self._Pyannote = Pyannote
+        self._vad_params = {
+            "vad_onset": vad_onset,
+            "vad_offset": vad_offset,
+            "chunk_size": chunk_size,
+        }
+
+        if vad_method == "silero":
+            self.vad_model = Silero(**self._vad_params)
+        elif vad_method == "pyannote":
+            device_vad = f"cuda:{device_index}" if (device == "cuda" or device == "auto") else device
+            self.vad_model = Pyannote(torch.device(device_vad), token=None, **self._vad_params)
+        else:
+            raise ValueError(f"Invalid vad_method: {vad_method}")
+
+    def detect(self, audio: Union[str, np.ndarray]) -> List[Dict[str, Any]]:
+        if isinstance(audio, str):
+            audio = self._load_audio(audio)
+
+        if issubclass(type(self.vad_model), self._Vad):
+            waveform = self.vad_model.preprocess_audio(audio)
+            merge_chunks = self.vad_model.merge_chunks
+        else:
+            waveform = self._Pyannote.preprocess_audio(audio)
+            merge_chunks = self._Pyannote.merge_chunks
+
+        vad_segments = self.vad_model({"waveform": waveform, "sample_rate": self._sample_rate})
+        vad_segments = merge_chunks(
+            vad_segments,
+            self._vad_params["chunk_size"],
+            onset=self._vad_params["vad_onset"],
+            offset=self._vad_params["vad_offset"],
+        )
+        return vad_segments
+
+
+def run_phase1_vad_only(audio_inputs: List[Any], args) -> List[Dict[str, Any]]:
+    runner = WhisperXPhase1VAD(
+        vad_method=args.vad_method,
+        vad_onset=args.vad_onset,
+        vad_offset=args.vad_offset,
+        chunk_size=args.chunk_size,
+        device=args.device,
+        device_index=args.vad_device_index,
+    )
+
+    results = []
+    for i, audio_input in enumerate(audio_inputs):
+        if isinstance(audio_input, str):
+            file_name = audio_input
+            audio_data = audio_input
+        elif isinstance(audio_input, dict) and "array" in audio_input:
+            file_name = audio_input.get("id", f"dataset_audio_{i}")
+            audio_data = audio_input["array"]
+        else:
+            file_name = f"audio_{i}"
+            audio_data = audio_input
+
+        vad_segments = runner.detect(audio_data)
+        speech_duration = sum(seg["end"] - seg["start"] for seg in vad_segments)
+        results.append(
+            {
+                "file": file_name,
+                "num_segments": len(vad_segments),
+                "speech_duration": speech_duration,
+                "segments": vad_segments,
+            }
+        )
+    return results
+
 
 def print_result(result: Dict[str, Any]):
     """Pretty print a single transcription result."""
-    import pdb;pdb.set_trace()
     print(f"\nFile: {result['file']}")
     print(f"Generation Time: {result['generation_time']:.2f}s")
     print(f"\n--- Raw Output ---")
@@ -262,7 +460,7 @@ def print_result(result: Dict[str, Any]):
         # for seg in result['segments'][:50]:  # Show first 50 segments
         for seg in result['segments']:  # Show first 50 segments
             print(f"[{seg.get('start_time', 'N/A')} - {seg.get('end_time', 'N/A')}] "
-                  f"Speaker {seg.get('speaker_id', 'N/A')}: {seg.get('text', '')}...\n")
+                  f"Speaker {seg.get('speaker_id', 'N/A')}: {seg.get('text', '')}")
         # if len(result['segments']) > 50:
         #     print(f"  ... and {len(result['segments']) - 50} more segments")
 
@@ -438,7 +636,7 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=2,
+        default=10,
         help="Batch size for processing multiple files"
     )
     parser.add_argument(
@@ -478,6 +676,53 @@ def main():
         default="auto",
         choices=["flash_attention_2", "sdpa", "eager", "auto"],
         help="Attention implementation to use. 'auto' will select the best available for your device (flash_attention_2 for CUDA, sdpa for MPS/CPU/XPU)"
+    )
+    parser.add_argument(
+        "--phase1_vad_only",
+        action="store_true",
+        help="Run WhisperX-style Phase1 VAD only and skip ASR transcription"
+    )
+    parser.add_argument(
+        "--phase1_vad_then_transcribe",
+        action="store_true",
+        help="Run WhisperX-style VAD first, then feed chunks into ASR transcription"
+    )
+    parser.add_argument(
+        "--vad_method",
+        type=str,
+        default="pyannote",
+        choices=["pyannote", "silero"],
+        help="VAD backend for Phase1 VAD mode"
+    )
+    parser.add_argument(
+        "--vad_onset",
+        type=float,
+        default=0.400,
+        help="Onset threshold for VAD"
+    )
+    parser.add_argument(
+        "--vad_offset",
+        type=float,
+        default=0.363,
+        help="Offset threshold for VAD"
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=1000,
+        help="Chunk size (seconds) for VAD merge"
+    )
+    parser.add_argument(
+        "--vad_device_index",
+        type=int,
+        default=0,
+        help="Device index for CUDA VAD backend"
+    )
+    parser.add_argument(
+        "--vad_output_json",
+        type=str,
+        default="",
+        help="Optional output json path for Phase1 VAD segments"
     )
     
     args = parser.parse_args()
@@ -530,17 +775,38 @@ def main():
     if concatenated_audio:
         print(f"\nConcatenated dataset audios: {len(concatenated_audio)} audio(s)")
     
-    # Initialize model
-    # Handle MPS device and dtype
+    # Combine all audio inputs
+    all_audio_inputs = audio_files + (concatenated_audio or [])
+    
+    print("\n" + "="*80)
+    print(f"Processing {len(all_audio_inputs)} audio(s)")
+    print("="*80)
+
+    if args.phase1_vad_only:
+        vad_results = run_phase1_vad_only(all_audio_inputs, args)
+        for result in vad_results:
+            print("\n" + "-" * 60)
+            print(f"File: {result['file']}")
+            print(f"VAD Segments: {result['num_segments']}")
+            print(f"Speech Duration: {result['speech_duration']:.2f}s")
+            if result["segments"]:
+                preview = result["segments"][:10]
+                print(json.dumps(preview, indent=2, ensure_ascii=False))
+        if args.vad_output_json:
+            with open(args.vad_output_json, "w", encoding="utf-8") as f:
+                json.dump(vad_results, f, indent=2, ensure_ascii=False)
+            print(f"\nSaved VAD results to: {args.vad_output_json}")
+        return
+
     if args.device == "mps":
-        model_dtype = torch.float32  # MPS works better with float32
+        model_dtype = torch.float32
     elif args.device == "xpu":
         model_dtype = torch.float32
     elif args.device == "cpu":
         model_dtype = torch.float32
     else:
         model_dtype = torch.bfloat16
-    
+
     asr = VibeVoiceASRBatchInference(
         model_path=args.model_path,
         device=args.device,
@@ -548,25 +814,37 @@ def main():
         attn_implementation=args.attn_implementation
     )
     
-    # If temperature is 0, use greedy decoding (no sampling)
     do_sample = args.temperature > 0
     
-    # Combine all audio inputs
-    all_audio_inputs = audio_files + (concatenated_audio or [])
-    
-    print("\n" + "="*80)
-    print(f"Processing {len(all_audio_inputs)} audio(s)")
-    print("="*80)
-    
-    all_results = asr.transcribe_with_batching(
-        all_audio_inputs,
-        batch_size=args.batch_size,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        do_sample=do_sample,
-        num_beams=args.num_beams,
-    )
+    if args.phase1_vad_then_transcribe:
+        vad_runner = WhisperXPhase1VAD(
+            vad_method=args.vad_method,
+            vad_onset=args.vad_onset,
+            vad_offset=args.vad_offset,
+            chunk_size=args.chunk_size,
+            device=args.device,
+            device_index=args.vad_device_index,
+        )
+        all_results = asr.transcribe_with_vad(
+            all_audio_inputs,
+            vad_runner=vad_runner,
+            batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            do_sample=do_sample,
+            num_beams=args.num_beams,
+        )
+    else:
+        all_results = asr.transcribe_with_batching(
+            all_audio_inputs,
+            batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            do_sample=do_sample,
+            num_beams=args.num_beams,
+        )
     
     # Print results
     print("\n" + "="*80)
