@@ -50,6 +50,17 @@ class ASRResult:
     segments: List[Dict[str, Any]] = field(default_factory=list)
     word_segments: List[Dict[str, Any]] = field(default_factory=list)
     language: str = "zh"  # Defaulting to Chinese for this test
+    
+    def __str__(self):
+        print_str = ""
+        for seg in self.segments:
+            print_str += f"{seg['start']:.2f} -> {seg['end']:.2f}: {seg['text']}\n"
+        for word_seg in self.word_segments:
+            if word_seg.get("start"):
+                print_str += f"{word_seg['start']:.2f} -> {word_seg['end']:.2f}: {word_seg['word']}\n"
+            else:
+                print_str += f"   ->   : {word_seg['word']}\n"
+        return print_str
 
 @dataclass
 class MergedResult:
@@ -184,7 +195,7 @@ class ASRClient:
                         ]
                     }
                 ],
-                "max_tokens": 8192,       
+                "max_tokens": 32768-1024,     
                 "temperature": 0.0,      
                 "stream": False,
                 "top_p": 1.0,
@@ -421,7 +432,7 @@ class WhisperXAligner:
                     print_progress=False,
                 )
                 
-                # Update the result with aligned segments and words
+                # Update the result with aligned segments and words in-place
                 res.segments = aligned_data["segments"]
                 res.word_segments = aligned_data.get("word_segments", [])
                 
@@ -497,11 +508,11 @@ class PostProcessor:
                     # Check if both are English/Number fragments
                     if res.language == "zh" and is_eng_or_num(text) and is_eng_or_num(prev_text):
                          # If original text has them separated by space, they are distinct words
-                         if prev_text + " " + text in original_text:
+                         if prev_text.strip() + " " + text.strip() in original_text:
                              step1_words.append(w)
                          else:
                              # Merge into previous word
-                             prev_w["word"] = prev_text + text
+                             prev_w["word"] = prev_text.strip() + text.strip()
                              if "end" in w:
                                  prev_w["end"] = max(prev_w.get("end", 0), w["end"])
                          continue
@@ -517,29 +528,32 @@ class PostProcessor:
                     text = w.get("word", "")
                     
                     if is_punct(text):
-                        if text in leading_puncts:
+                        stripped_text = text.strip()
+                        if stripped_text in leading_puncts:
                             # Leading punctuation: buffer it for the next word
-                            pending_prefix += text
+                            pending_prefix += stripped_text
                             if pending_start is None:
                                 pending_start = w.get("start")
                         else:
                             # Trailing punctuation: attach to previous word
                             if final_words:
-                                final_words[-1]["word"] += text
+                                if not final_words[-1]["word"].rstrip().endswith(stripped_text):
+                                    final_words[-1]["word"] = final_words[-1]["word"].rstrip() + stripped_text
                                 if "end" in w:
                                     final_words[-1]["end"] = max(final_words[-1].get("end", 0), w["end"])
                             else:
                                 # Edge case: starts with trailing punct (e.g. "...Hello")
-                                # If we have pending prefix, append to it? Or treat as word?
                                 if pending_prefix:
-                                    pending_prefix += text
+                                    if not pending_prefix.endswith(stripped_text):
+                                        pending_prefix += stripped_text
                                 else:
                                     final_words.append(w)
                         continue
                         
                     # Normal word processing
                     if pending_prefix:
-                        w["word"] = pending_prefix + w["word"]
+                        if not w["word"].lstrip().startswith(pending_prefix):
+                            w["word"] = pending_prefix + w["word"].lstrip()
                         if pending_start is not None:
                             w["start"] = min(w.get("start", float('inf')), pending_start)
                         pending_prefix = ""
@@ -550,12 +564,32 @@ class PostProcessor:
                 # Handle leftover pending prefix (rare, e.g. sentence ends with opening bracket)
                 if pending_prefix:
                     if final_words:
-                        final_words[-1]["word"] += pending_prefix
+                        if not final_words[-1]["word"].rstrip().endswith(pending_prefix):
+                            final_words[-1]["word"] = final_words[-1]["word"].rstrip() + pending_prefix
                     else:
                         # Only punctuation in segment?
                         pass
 
                 seg["words"] = final_words
+                
+                # Reconstruct segment text to reflect merged words and attached punctuation
+                if final_words:
+                    new_text = ""
+                    for i, fw in enumerate(final_words):
+                        w_text = fw.get("word", "").strip()
+                        if not new_text:
+                            new_text = w_text
+                        else:
+                            if res.language == "en":
+                                new_text += " " + w_text
+                            else:
+                                prev_w_text = final_words[i-1].get("word", "").strip()
+                                # Add space between two English/Number words in Chinese context
+                                if is_eng_or_num(w_text) and is_eng_or_num(prev_w_text):
+                                    new_text += " " + w_text
+                                else:
+                                    new_text += w_text
+                    seg["text"] = new_text
                 
         print(f"✅ [PostProcessor] Cleaned word segments for {len(asr_results)} chunks.")
         return asr_results
