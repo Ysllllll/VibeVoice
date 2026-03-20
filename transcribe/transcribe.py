@@ -11,7 +11,6 @@ This script demonstrates an engineering-focused pipeline:
 6. PostProcessor: Formats the final word-level aligned results.
 """
 
-import os
 import json
 import base64
 import time
@@ -21,6 +20,10 @@ import aiohttp
 import subprocess
 import tempfile
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from openai import OpenAI
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
@@ -28,6 +31,8 @@ from typing import List, Dict, Any, Optional
 from whisperx_utils.alignment import align, load_align_model
 from whisperx_utils.schema import AlignedTranscriptionResult
 from whisperx_utils.audio import load_audio
+
+from subtitle_formatter import Subtitle
 
 def is_eng_or_num(s: str) -> bool:
     """Matches English letters, numbers, and basic word symbols like apostrophe."""
@@ -109,7 +114,7 @@ class AudioProcessor:
         chunks = []
         for file_path in file_paths:
             duration = self._get_duration(file_path)
-            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            base_name = Path(file_path).stem
             
             current_time = 0.0
             idx = 0
@@ -120,9 +125,11 @@ class AudioProcessor:
                 
             while current_time < duration:
                 chunk_file = f"{base_name}_{idx:04d}.wav"
-                chunk_path = os.path.join(self.temp_dir, chunk_file)
+                chunk_path = str(Path(self.temp_dir) / chunk_file)
                 
                 end_time = min(current_time + self.chunk_duration, duration)
+                if duration - end_time < self.chunk_duration / 2:
+                    end_time = duration
                 actual_duration = end_time - current_time
                 
                 cmd = [
@@ -142,12 +149,13 @@ class AudioProcessor:
                     end_time=end_time,
                     duration=actual_duration
                 ))
+                print(f"🔊 [AudioProcessor] Created chunk: {chunk_file} ({actual_duration:.2f}s)")
                 
                 idx += 1
                 current_time += step
                 
                 # To prevent creating tiny useless chunks at the end
-                if duration - current_time < 0.1:
+                if duration - end_time < 0.1:
                     break
                 
         print(f"✅ [AudioProcessor] Generated {len(chunks)} chunks in total.")
@@ -156,22 +164,41 @@ class AudioProcessor:
     def cleanup(self):
         """Clean up the temporary directory containing audio chunks."""
         import shutil
-        if self.temp_dir and os.path.exists(self.temp_dir):
+        if self.temp_dir and Path(self.temp_dir).exists():
             shutil.rmtree(self.temp_dir)
             print(f"🧹 [AudioProcessor] Cleaned up temporary directory: {self.temp_dir}")
 
 
 class ASRClient:
-    """Sends chunks to vLLM API concurrently."""
-    def __init__(self, base_url: str = "http://localhost:8000", max_concurrent: int = 10):
+    """Sends chunks to vLLM API concurrently using ThreadPoolExecutor and OpenAI client."""
+    def __init__(self, base_url: str = "http://localhost:8000", max_concurrent: int = 5):
         self.base_url = base_url
         self.max_concurrent = max_concurrent
+        self.client = OpenAI(
+            api_key="EMPTY",  # vLLM doesn't strictly require a real key
+            base_url=f"{base_url}/v1"
+        )
         
     def _guess_mime_type(self, path: str) -> str:
-        return "audio/wav"
+        """Guess MIME type from file extension."""
+        ext = Path(path).suffix.lower()
+        mime_map = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".mp4": "video/mp4",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/ogg",
+        }
+        return mime_map.get(ext, "application/octet-stream")
 
-    async def _process_chunk(self, session: aiohttp.ClientSession, chunk: AudioChunk, semaphore: asyncio.Semaphore) -> ASRResult:
-        async with semaphore:
+    def process(self, chunks: List[AudioChunk], print_time: bool = True) -> List[ASRResult]:
+        total_chunks = len(chunks)
+        completed = 0
+        lock = threading.Lock()
+        def _process_chunk(chunk: AudioChunk) -> ASRResult:
+            nonlocal completed
             with open(chunk.chunk_path, "rb") as f:
                 audio_bytes = f.read()
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
@@ -179,62 +206,82 @@ class ASRClient:
             mime = self._guess_mime_type(chunk.chunk_path)
             data_url = f"data:{mime};base64,{audio_b64}"
             
-            show_keys = ["Start time", "End time", "Speaker ID", "Content", "Language"]
+            show_keys = ["Start time", "End time", "Content", "Language"]
             prompt_text = (
-                f"This is a {chunk.duration:.2f} seconds audio, please transcribe it with these keys: "
+                f"This is a {chunk.duration:.2f} seconds audio, with extra info: 简体中文\n\nPlease transcribe it with these keys: "
                 + ", ".join(show_keys)
             )
 
-            payload = {
-                "model": "vibevoice",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that transcribes audio input into text output in JSON format."
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "audio_url", "audio_url": {"url": data_url}},
-                            {"type": "text", "text": prompt_text}
-                        ]
-                    }
-                ],
-                "max_tokens": 32768-1024,     
-                "temperature": 0.0,      
-                "stream": False,
-                "top_p": 1.0,
-            }
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that transcribes audio input into text output in JSON format."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio_url", "audio_url": {"url": data_url}},
+                        {"type": "text", "text": prompt_text}
+                    ]
+                }
+            ]
             
-            url = f"{self.base_url}/v1/chat/completions"
-            try:
-                async with session.post(url, json=payload, timeout=600) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        content = data['choices'][0]['message']['content']
-                        return ASRResult(chunk=chunk, raw_response=content)
-                    else:
-                        text = await response.text()
-                        print(f"❌ [ASRClient] Error {response.status}: {text}")
-                        return ASRResult(chunk=chunk, raw_response="[]")
-            except Exception as e:
-                print(f"❌ [ASRClient] Request failed: {e}")
-                return ASRResult(chunk=chunk, raw_response="[]")
+            max_retries = 4
+            for attempt in range(max_retries):
+                try:
+                    response = self.client.chat.completions.create(
+                        model="vibevoice",
+                        messages=messages,
+                        max_tokens=4096,     
+                        temperature=0.0 if attempt == 0 else (attempt * 0.1), # 失败重试时稍微提高一点temperature增加随机性
+                        stream=False,
+                        top_p=1.0 if attempt == 0 else 0.95,
+                    )
+                    content = response.choices[0].message.content
+                        
+                    
+                    # Simple validation to check if the content looks like a valid JSON list
+                    # Since the prompt asks for JSON format and specific keys
+                    cleaned_content = content.strip()
+                    if cleaned_content.startswith("```json"):
+                        cleaned_content = cleaned_content[7:]
+                    if cleaned_content.startswith("```"):
+                        cleaned_content = cleaned_content[3:]
+                    cleaned_content = cleaned_content.strip()
+                    
+                    json.loads(cleaned_content)
+                    
+                    with lock:
+                        completed += 1
+                    return ASRResult(chunk=chunk, raw_response=content)
+                except Exception as e:
+                    print(f"❌ [ASRClient] Request failed for chunk {Path(chunk.chunk_path).name} (Attempt {attempt+1}/{max_retries}): {e}")
+                finally:
+                    with lock:
+                        width = len(str(total_chunks))
+                        if response and hasattr(response, 'usage'):
+                            print(f"🔍 [ASRClient] {completed:-{width}}/{total_chunks} ({(completed/total_chunks)*100:.1f}%). Token usage: {response.usage}")
+                        else:
+                            print(f"🔄 [ASRClient] Progress: {completed:-{width}}/{total_chunks} ({(completed/total_chunks)*100:.1f}%)")
+                    
+            # If all retries fail
+            print(f"🚨 [ASRClient] All {max_retries} attempts failed for chunk {Path(chunk.chunk_path).name}.")
+            return ASRResult(chunk=chunk, raw_response="[]")
 
-    async def process_async(self, chunks: List[AudioChunk]) -> List[ASRResult]:
+        if print_time:
+            start_time = time.time()
+            
         print(f"🚀 [ASRClient] Starting concurrent API requests for {len(chunks)} chunks (max_concurrent={self.max_concurrent})...")
-        semaphore = asyncio.Semaphore(self.max_concurrent)
-        # Using larger timeout for heavy models
-        timeout = aiohttp.ClientTimeout(total=1800)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            tasks = [self._process_chunk(session, chunk, semaphore) for chunk in chunks]
-            results = await asyncio.gather(*tasks)
-        print(results)
-        print(f"✅ [ASRClient] Completed {len(results)} API requests.")
-        return results
+        
+        # 可能存在一个问题，就是如果重试塞满了队列，耗时会很久
+        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+            # executor.map maintains the order of the original chunks list
+            results = list(executor.map(_process_chunk, chunks))
 
-    def process(self, chunks: List[AudioChunk]) -> List[ASRResult]:
-        return asyncio.run(self.process_async(chunks))
+        if print_time:
+            end_time = time.time()
+            print(f"⏱️ [ASRClient] Total processing time: {end_time - start_time:.2f} seconds")
+        return results
 
 
 class ASRCleaner:
@@ -271,7 +318,7 @@ class ASRCleaner:
                 speaker = item.get("Speaker ID", item.get("Speaker", item.get("speaker", 0)))
                 
                 # Remove empty texts or pure silence tags
-                if not text or text.lower() == "[silence]":
+                if not text or text.lower() == "[silence]" or text.lower() == "[music]" or text.lower() == "[human sounds]" or text.lower() == "[environmental sounds]":
                     continue
                     
                 cleaned_segments.append({
@@ -311,8 +358,12 @@ class ResultMerger:
             last_w = merged[-1]
             
             # Calculate overlap
-            start1, end1 = last_w["start"], last_w["end"]
-            start2, end2 = w["start"], w["end"]
+            try:
+                start1, end1 = last_w["start"], last_w["end"]
+                start2, end2 = w["start"], w["end"]
+            except Exception as e:
+                import pdb;pdb.set_trace()
+                print("test")
             
             overlap_start = max(start1, start2)
             overlap_end = min(end1, end2)
@@ -400,9 +451,9 @@ class ResultMerger:
                 # Adjust timestamps
                 for w in chunk_words:
                     w_global = w.copy()
-                    if "start" in w_global: w_global["start"] += offset
-                    if "end" in w_global: w_global["end"] += offset
-                    
+                    if "start" in w_global and "end" in w_global:
+                        w_global["start"] += offset
+                        w_global["end"] += offset
                     # Calculate distance to center for conflict resolution
                     if "start" in w_global and "end" in w_global:
                         w_center = (w_global["start"] + w_global["end"]) / 2
@@ -657,12 +708,54 @@ class PostProcessor:
                     seg["text"] = new_text
                 
         print(f"✅ [PostProcessor] Cleaned word segments for {len(asr_results)} chunks.")
+
+        # 刷新word_segments
+        # 处理没有时间戳的word
+        for res in asr_results:
+            for seg in res.segments:
+                words = seg.get("words", [])
+                prev_word = {"end": 0.0}
+                char_time = 0
+                char_leng = 1e-7
+                for idx, word in enumerate(words):
+                    if word.get("start") == None:
+                        next_idx = idx + 1
+                        while (
+                            next_idx < len(words)
+                            and words[next_idx].get("start") == None
+                        ):
+                            next_idx += 1
+                        next_idx = min(next_idx, len(words) - 1)
+                        next_time = words[next_idx].get("start", seg.get("end", 1e16))
+                        if prev_word["end"] == next_time:
+                            prev_word["end"] = prev_word["end"] - (
+                                min(1, prev_word["end"] - prev_word["start"]) * 0.99
+                            )
+
+                        unit_time = char_time / char_leng
+                        word["start"] = prev_word["end"]
+                        word["end"] = min(
+                            next_time, word["start"] + unit_time * len(word["word"])
+                        )
+                        word["score"] = 0.49
+                    char_time += word["end"] - word["start"]
+                    char_leng += len(word["word"])
+                    prev_word = word
+
+        for res in asr_results:
+            res.word_segments = []
+            for seg in res.segments:
+                seg["words"] = seg.get("words", [])
+                res.word_segments.extend(seg["words"])
+            res.raw_response = ""
         return asr_results
 
-    def format_and_save(self, aligned_results: List[MergedResult]) -> List[Dict]:
-        """Formats to WhisperX schema and saves to JSON and SRT."""
-        print(f"📝 [PostProcessor] Formatting final results (WhisperX compatible) & saving...")
-        final_outputs = []
+    def save_json(self, aligned_results: List[MergedResult], output_dir: str) -> List[str]:
+        """Formats to WhisperX schema and saves to JSON."""
+        print(f"📝 [PostProcessor] Formatting final results (WhisperX compatible) & saving to JSON...")
+        json_paths = []
+        if not Path(output_dir).exists():
+            Path(output_dir).mkdir(parents=True)
         for res in aligned_results:
             # Clean up missing timestamps, etc.
             cleaned_segments = []
@@ -693,32 +786,42 @@ class PostProcessor:
                 "language": res.language,
                 "word_segments": word_segments
             }
-            final_outputs.append(output)
             
             # Save to JSON
-            out_path = f"{res.original_file}.aligned.json"
+            out_path = Path(output_dir) / f"{Path(res.original_file).stem}.json"
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(output, f, ensure_ascii=False, indent=2)
             print(f"  -> Saved final result to {out_path}")
+            json_paths.append(out_path)
             
-            # Save to SRT
-            srt_path = f"{os.path.splitext(res.original_file)[0]}.srt"
-            with open(srt_path, "w", encoding="utf-8") as f:
-                for i, seg in enumerate(cleaned_segments, 1):
-                    start_str = self._format_srt_time(seg.get("start", 0.0))
-                    end_str = self._format_srt_time(seg.get("end", 0.0))
-                    text = seg.get("text", "").strip()
-                    f.write(f"{i}\n{start_str} --> {end_str}\n{text}\n\n")
-            print(f"  -> Saved SRT subtitle to {srt_path}")
-            
-        return final_outputs
+        return json_paths
 
-    def process(self, data: Any, stage: str = "format_and_save") -> Any:
+    def save_srt(self, json_paths: List[str], output_dir: str):
+        """Reads JSON files and exports them to SRT format."""
+        print(f"📝 [PostProcessor] Generating SRT files from JSON...")
+        if not Path(output_dir).exists():
+            Path(output_dir).mkdir(parents=True)
+        for json_path in json_paths:
+            # Remove .aligned.json and replace with .srt, or just replace .json
+            srt_path = Path(output_dir) / Path(json_path).with_suffix(".srt").name
+            
+            # Initialize subtitle formatter with JSON file
+            sub_formatter = Subtitle.from_whisperx_json(json_path)
+            # Use smart grouping (max 30 chars per line, cascade splitting)
+            sub_formatter.group_smart(max_chars=30)
+            # Export to SRT
+            sub_formatter.to_srt(srt_path)
+            
+            print(f"  -> Saved smart SRT subtitle to {srt_path}")
+
+    def process(self, data: Any, stage: str = "save_json", output_dir: str = "json_output") -> Any:
         """Dispatcher for different post-processing stages."""
         if stage == "clean_words":
             return self.clean_word_alignments(data)
-        elif stage == "format_and_save":
-            return self.format_and_save(data)
+        elif stage == "save_json":
+            return self.save_json(data, output_dir)
+        elif stage == "save_srt":
+            return self.save_srt(data, output_dir)
         else:
             raise ValueError(f"Unknown post-processing stage: {stage}")
 
@@ -726,60 +829,176 @@ class PostProcessor:
 # Pipeline Runner (组装器)
 # ============================================================================
 
+def process_input_paths(file_paths: List[str]) -> List[str]:
+    """Process input paths: handle directories, filter valid files, and extract audio from videos."""
+    valid_audio_exts = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.aac'}
+    valid_video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
+    
+    processed_files = []
+    
+    # Flatten the input list if it contains directories
+    expanded_paths = []
+    for path_str in file_paths:
+        p = Path(path_str)
+        if p.is_dir():
+            print(f"📂 [InputProcessor] Scanning directory: {p}")
+            # Collect all files recursively
+            for f in p.rglob("*"):
+                if f.is_file() and f.suffix.lower() in (valid_audio_exts | valid_video_exts):
+                    expanded_paths.append(f)
+        elif p.is_file():
+            expanded_paths.append(p)
+        else:
+            print(f"⚠️ [InputProcessor] Path not found: {p}")
+
+    # Process each file
+    for p in expanded_paths:
+        ext = p.suffix.lower()
+        if ext in valid_audio_exts:
+            processed_files.append(str(p))
+        elif ext in valid_video_exts:
+            print(f"🎬 [InputProcessor] Extracting audio from video: {p.name}")
+            # Output path for extracted audio
+            out_audio = p.with_suffix('.wav')
+            
+            # If the wav file already exists, we skip extraction
+            if not out_audio.exists():
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(p),
+                    "-vn",  # No video
+                    "-acodec", "pcm_s16le",
+                    "-ar", "24000",
+                    "-ac", "1",
+                    str(out_audio)
+                ]
+                try:
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    print(f"   -> Extracted to: {out_audio.name}")
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ [InputProcessor] Failed to extract audio from {p.name}: {e}")
+                    continue
+            else:
+                print(f"   -> Audio already extracted: {out_audio.name}")
+                
+            processed_files.append(str(out_audio))
+        else:
+            print(f"⚠️ [InputProcessor] Unsupported file type: {p.name}")
+    # 这里需要对文件做一次去重，可能会出现重复文件名的文件。
+    # 按 stem 去重：保留第一个出现的文件（含路径），忽略后续同名不同扩展名的文件
+    seen_stems = set()
+    deduped = []
+    for f in processed_files:
+        stem = Path(f).stem
+        if stem not in seen_stems:
+            seen_stems.add(stem)
+            deduped.append(f)
+        else:
+            print(f"⚠️ [InputProcessor] 跳过重复 stem 的文件: {f}")
+    return deduped
+
 def run_pipeline(
     file_paths: List[str],
     api_url: str = "http://localhost:8000",
     chunk_duration: int = 720,
     overlap: int = 20,
-    max_concurrent: int = 10,
-    device: str = "cpu"
+    max_concurrent: int = 5,
+    device: str = "cpu",
+    json_output: str = "json_output",
+    srt_output: str = "srt_output"
 ):
     print(f"{'='*60}\n🚀 Starting Engineering VibeVoice Pipeline\n{'='*60}")
     
+    pipeline_start_time = time.time()
+    timings = {}
+
+    def record_time(stage_name, start_time):
+        elapsed = time.time() - start_time
+        timings[stage_name] = elapsed
+        print(f"⏱️ [Timer] {stage_name} completed in {elapsed:.2f} seconds.\n")
+
+    # 0. Input Preprocessing
+    t0 = time.time()
+    file_paths = process_input_paths(file_paths)
+    if not file_paths:
+        print("❌ [Error] No valid audio or video files found. Exiting.")
+        return []
+    else:
+        print(f"✅ [InputProcessor] Found {len(file_paths)} valid files for processing: " + "\n".join(f"  - {idx+1}: {i}" for idx, i in enumerate(file_paths)))
+    record_time("0. Input Preprocessing", t0)
+
     # 1. Chunking
+    t0 = time.time()
     processor = AudioProcessor(chunk_duration=chunk_duration, overlap=overlap)
     chunks = processor.process(file_paths)
+    record_time("1. Audio Chunking", t0)
     
     # 2. ASR API Requests
+    t0 = time.time()
     client = ASRClient(base_url=api_url, max_concurrent=max_concurrent)
     raw_results = client.process(chunks)
-    
+    record_time("2. ASR API Requests", t0)
     # 3. Clean API Outputs
+    t0 = time.time()
     cleaner = ASRCleaner()
     cleaned_results = cleaner.process(raw_results)
+    record_time("3. Clean API Outputs", t0)
     
     # 这里可以做标点符号校准
     
     # 4. WhisperX Alignment (on Chunks)
+    t0 = time.time()
     aligner = WhisperXAligner(device=device)
     aligned_chunks = aligner.process(cleaned_results)
+    record_time("4. WhisperX Alignment", t0)
     
     # 4.5 Clean Word Alignments (Merge chars & punctuation) via PostProcessor
+    t0 = time.time()
     post_processor = PostProcessor()
     aligned_clean_chunks = post_processor.process(aligned_chunks, stage="clean_words")
+    record_time("4.5 Clean Word Alignments", t0)
     
     # 5. Merge Results
+    t0 = time.time()
     merger = ResultMerger()
     merged_results = merger.process(aligned_clean_chunks)
+    record_time("5. Merge Results", t0)
     
     # 6. Post Processing & Output (Format and Save)
-    # Now MergedResult acts as AlignedResult
-    final_outputs = post_processor.process(merged_results, stage="format_and_save")
+    t0 = time.time()
+    # Save to JSON first
+    json_paths = post_processor.process(merged_results, stage="save_json", output_dir=json_output)
+    # Read from JSON and save to SRT
+    if srt_output:
+        post_processor.process(json_paths, stage="save_srt", output_dir=srt_output)
+    record_time("6. Post Processing & Output", t0)
     
     # 7. Cleanup
+    t0 = time.time()
     processor.cleanup()
+    record_time("7. Cleanup", t0)
+    
+    total_time = time.time() - pipeline_start_time
+    
+    print(f"{'='*60}\n📊 Pipeline Timing Summary\n{'-'*60}")
+    for stage, elapsed in timings.items():
+        print(f"  - {stage:<30}: {elapsed:>8.2f}s")
+    print(f"{'-'*60}")
+    print(f"  - {'Total Time':<30}: {total_time:>8.2f}s")
     
     print(f"\n🎉 Pipeline Finished Successfully!\n{'='*60}")
-    return final_outputs
+    return json_paths
 
 def main():
     parser = argparse.ArgumentParser(description="Test VibeVoice API + WhisperX Alignment Pipeline")
     parser.add_argument("audio_paths", nargs="+", help="Paths to audio files to process")
     parser.add_argument("--url", default="http://localhost:8000", help="vLLM server URL")
-    parser.add_argument("--chunk_duration", type=int, default=720, help="Audio chunk size in seconds")
+    parser.add_argument("--chunk_duration", type=int, default=300, help="Audio chunk size in seconds")
     parser.add_argument("--overlap", type=int, default=20, help="Overlap between chunks in seconds")
-    parser.add_argument("--concurrency", type=int, default=10, help="Max concurrent API requests")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Device for WhisperX alignment")
+    parser.add_argument("--concurrency", type=int, default=5, help="Max concurrent API requests")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4"], help="Device for WhisperX alignment")
+    parser.add_argument("--json_output", default="json_output", help="Directory to save JSON files")
+    parser.add_argument("--srt_output", default="srt_output", help="Directory to save SRT files")
     
     args = parser.parse_args()
     
@@ -789,7 +1008,9 @@ def main():
         chunk_duration=args.chunk_duration,
         overlap=args.overlap,
         max_concurrent=args.concurrency,
-        device=args.device
+        device=args.device,
+        json_output=args.json_output,
+        srt_output=args.srt_output
     )
 
 if __name__ == "__main__":

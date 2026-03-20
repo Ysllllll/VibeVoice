@@ -392,6 +392,7 @@ def stream_with_recovery(
                             is_looping, good_end = detector._check_repetition()
                             
                             if is_looping:
+                                _log(detector.text)
                                 _log(f"[LOOP DETECTED at char {good_end}]")
                                 
                                 # Use what user has already seen as prefix for retry
