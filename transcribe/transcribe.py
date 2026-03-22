@@ -109,7 +109,82 @@ class AudioProcessor:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
         return float(out)
 
+    def process_input_paths(self, file_paths: List[str]) -> List[str]:
+        """Process input paths: handle directories, filter valid files, and extract audio from videos."""
+        valid_audio_exts = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.aac'}
+        valid_video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
+
+        processed_files = []
+
+        # Flatten the input list if it contains directories
+        expanded_paths = []
+        for path_str in file_paths:
+            p = Path(path_str)
+            if p.is_dir():
+                print(f"📂 [InputProcessor] Scanning directory: {p}")
+                # Collect all files recursively
+                for f in p.rglob("*"):
+                    if f.is_file() and f.suffix.lower() in (valid_audio_exts | valid_video_exts):
+                        expanded_paths.append(f)
+            elif p.is_file():
+                expanded_paths.append(p)
+            else:
+                print(f"⚠️ [InputProcessor] Path not found: {p}")
+
+        # Process each file
+        for p in expanded_paths:
+            ext = p.suffix.lower()
+            if ext in valid_audio_exts:
+                processed_files.append(str(p))
+            elif ext in valid_video_exts:
+                print(f"🎬 [InputProcessor] Extracting audio from video: {p.name}")
+                # Output path for extracted audio
+                out_audio = p.with_suffix('.wav')
+
+                # If the wav file already exists, we skip extraction
+                if not out_audio.exists():
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", str(p),
+                        "-vn",  # No video
+                        "-acodec", "pcm_s16le",
+                        "-ar", "24000",
+                        "-ac", "1",
+                        str(out_audio)
+                    ]
+                    try:
+                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                        print(f"   -> Extracted to: {out_audio.name}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"❌ [InputProcessor] Failed to extract audio from {p.name}: {e}")
+                        continue
+                else:
+                    print(f"   -> Audio already extracted: {out_audio.name}")
+                processed_files.append(str(out_audio))
+            else:
+                print(f"⚠️ [InputProcessor] Unsupported file type: {p.name}")
+        # 这里需要对文件做一次去重，可能会出现重复文件名的文件。
+        # 按 stem 去重：保留第一个出现的文件（含路径），忽略后续同名不同扩展名的文件
+        seen_stems = set()
+        deduped = []
+        for f in processed_files:
+            stem = Path(f).stem
+            if stem not in seen_stems:
+                seen_stems.add(stem)
+                deduped.append(f)
+            else:
+                print(f"⚠️ [InputProcessor] 跳过重复 stem 的文件: {f}")
+        return deduped
+
+
     def process(self, file_paths: List[str]) -> List[AudioChunk]:
+        file_paths = self.process_input_paths(file_paths)
+        if not file_paths:
+            print("❌ [Error] No valid audio or video files found. Exiting.")
+            return []
+        else:
+            print(f"✅ [InputProcessor] Found {len(file_paths)} valid files for processing: " + "\n".join(f"  - {idx+1}: {i}" for idx, i in enumerate(file_paths)))
+
         print(f"🎵 [AudioProcessor] Splitting {len(file_paths)} files into ~{self.chunk_duration}s chunks (overlap={self.overlap}s)...")
         chunks = []
         for file_path in file_paths:
@@ -193,10 +268,11 @@ class ASRClient:
         }
         return mime_map.get(ext, "application/octet-stream")
 
-    def process(self, chunks: List[AudioChunk], print_time: bool = True) -> List[ASRResult]:
+    def process(self, chunks: List[AudioChunk], language: str = "en") -> List[ASRResult]:
         total_chunks = len(chunks)
         completed = 0
         lock = threading.Lock()
+        extrainfo = "简体中文" if language == "zh" else "Microsoft,VibeVoice" 
         def _process_chunk(chunk: AudioChunk) -> ASRResult:
             nonlocal completed
             with open(chunk.chunk_path, "rb") as f:
@@ -206,9 +282,9 @@ class ASRClient:
             mime = self._guess_mime_type(chunk.chunk_path)
             data_url = f"data:{mime};base64,{audio_b64}"
             
-            show_keys = ["Start time", "End time", "Content", "Language"]
+            show_keys = ["Start time", "End time", "Speaker ID", "Content"]
             prompt_text = (
-                f"This is a {chunk.duration:.2f} seconds audio, with extra info: 简体中文\n\nPlease transcribe it with these keys: "
+                f"This is a {chunk.duration:.2f} seconds audio, with extra info: {extrainfo}\n\nPlease transcribe it with these keys: "
                 + ", ".join(show_keys)
             )
 
@@ -268,19 +344,12 @@ class ASRClient:
             print(f"🚨 [ASRClient] All {max_retries} attempts failed for chunk {Path(chunk.chunk_path).name}.")
             return ASRResult(chunk=chunk, raw_response="[]")
 
-        if print_time:
-            start_time = time.time()
-            
         print(f"🚀 [ASRClient] Starting concurrent API requests for {len(chunks)} chunks (max_concurrent={self.max_concurrent})...")
-        
+
         # 可能存在一个问题，就是如果重试塞满了队列，耗时会很久
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
             # executor.map maintains the order of the original chunks list
             results = list(executor.map(_process_chunk, chunks))
-
-        if print_time:
-            end_time = time.time()
-            print(f"⏱️ [ASRClient] Total processing time: {end_time - start_time:.2f} seconds")
         return results
 
 
@@ -358,13 +427,9 @@ class ResultMerger:
             last_w = merged[-1]
             
             # Calculate overlap
-            try:
-                start1, end1 = last_w["start"], last_w["end"]
-                start2, end2 = w["start"], w["end"]
-            except Exception as e:
-                import pdb;pdb.set_trace()
-                print("test")
-            
+            start1, end1 = last_w["start"], last_w["end"]
+            start2, end2 = w["start"], w["end"]
+
             overlap_start = max(start1, start2)
             overlap_end = min(end1, end2)
             overlap_dur = max(0, overlap_end - overlap_start)
@@ -829,74 +894,6 @@ class PostProcessor:
 # Pipeline Runner (组装器)
 # ============================================================================
 
-def process_input_paths(file_paths: List[str]) -> List[str]:
-    """Process input paths: handle directories, filter valid files, and extract audio from videos."""
-    valid_audio_exts = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.aac'}
-    valid_video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
-    
-    processed_files = []
-    
-    # Flatten the input list if it contains directories
-    expanded_paths = []
-    for path_str in file_paths:
-        p = Path(path_str)
-        if p.is_dir():
-            print(f"📂 [InputProcessor] Scanning directory: {p}")
-            # Collect all files recursively
-            for f in p.rglob("*"):
-                if f.is_file() and f.suffix.lower() in (valid_audio_exts | valid_video_exts):
-                    expanded_paths.append(f)
-        elif p.is_file():
-            expanded_paths.append(p)
-        else:
-            print(f"⚠️ [InputProcessor] Path not found: {p}")
-
-    # Process each file
-    for p in expanded_paths:
-        ext = p.suffix.lower()
-        if ext in valid_audio_exts:
-            processed_files.append(str(p))
-        elif ext in valid_video_exts:
-            print(f"🎬 [InputProcessor] Extracting audio from video: {p.name}")
-            # Output path for extracted audio
-            out_audio = p.with_suffix('.wav')
-            
-            # If the wav file already exists, we skip extraction
-            if not out_audio.exists():
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(p),
-                    "-vn",  # No video
-                    "-acodec", "pcm_s16le",
-                    "-ar", "24000",
-                    "-ac", "1",
-                    str(out_audio)
-                ]
-                try:
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                    print(f"   -> Extracted to: {out_audio.name}")
-                except subprocess.CalledProcessError as e:
-                    print(f"❌ [InputProcessor] Failed to extract audio from {p.name}: {e}")
-                    continue
-            else:
-                print(f"   -> Audio already extracted: {out_audio.name}")
-                
-            processed_files.append(str(out_audio))
-        else:
-            print(f"⚠️ [InputProcessor] Unsupported file type: {p.name}")
-    # 这里需要对文件做一次去重，可能会出现重复文件名的文件。
-    # 按 stem 去重：保留第一个出现的文件（含路径），忽略后续同名不同扩展名的文件
-    seen_stems = set()
-    deduped = []
-    for f in processed_files:
-        stem = Path(f).stem
-        if stem not in seen_stems:
-            seen_stems.add(stem)
-            deduped.append(f)
-        else:
-            print(f"⚠️ [InputProcessor] 跳过重复 stem 的文件: {f}")
-    return deduped
-
 def run_pipeline(
     file_paths: List[str],
     api_url: str = "http://localhost:8000",
@@ -905,7 +902,8 @@ def run_pipeline(
     max_concurrent: int = 5,
     device: str = "cpu",
     json_output: str = "json_output",
-    srt_output: str = "srt_output"
+    srt_output: str = "srt_output",
+    language: str = "zh"
 ):
     print(f"{'='*60}\n🚀 Starting Engineering VibeVoice Pipeline\n{'='*60}")
     
@@ -917,16 +915,6 @@ def run_pipeline(
         timings[stage_name] = elapsed
         print(f"⏱️ [Timer] {stage_name} completed in {elapsed:.2f} seconds.\n")
 
-    # 0. Input Preprocessing
-    t0 = time.time()
-    file_paths = process_input_paths(file_paths)
-    if not file_paths:
-        print("❌ [Error] No valid audio or video files found. Exiting.")
-        return []
-    else:
-        print(f"✅ [InputProcessor] Found {len(file_paths)} valid files for processing: " + "\n".join(f"  - {idx+1}: {i}" for idx, i in enumerate(file_paths)))
-    record_time("0. Input Preprocessing", t0)
-
     # 1. Chunking
     t0 = time.time()
     processor = AudioProcessor(chunk_duration=chunk_duration, overlap=overlap)
@@ -936,16 +924,16 @@ def run_pipeline(
     # 2. ASR API Requests
     t0 = time.time()
     client = ASRClient(base_url=api_url, max_concurrent=max_concurrent)
-    raw_results = client.process(chunks)
+    raw_results = client.process(chunks, language=language)
     record_time("2. ASR API Requests", t0)
+
     # 3. Clean API Outputs
     t0 = time.time()
     cleaner = ASRCleaner()
     cleaned_results = cleaner.process(raw_results)
     record_time("3. Clean API Outputs", t0)
     
-    # 这里可以做标点符号校准
-    
+    # 这里可以做标点符号校准    
     # 4. WhisperX Alignment (on Chunks)
     t0 = time.time()
     aligner = WhisperXAligner(device=device)
@@ -999,6 +987,7 @@ def main():
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4"], help="Device for WhisperX alignment")
     parser.add_argument("--json_output", default="json_output", help="Directory to save JSON files")
     parser.add_argument("--srt_output", default="srt_output", help="Directory to save SRT files")
+    parser.add_argument("--language", default="zh", help="Language for ASR")
     
     args = parser.parse_args()
     
@@ -1010,7 +999,8 @@ def main():
         max_concurrent=args.concurrency,
         device=args.device,
         json_output=args.json_output,
-        srt_output=args.srt_output
+        srt_output=args.srt_output,
+        language=args.language
     )
 
 if __name__ == "__main__":
