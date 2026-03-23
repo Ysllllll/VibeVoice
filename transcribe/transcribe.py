@@ -21,11 +21,13 @@ import subprocess
 import tempfile
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from openai import OpenAI
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
+from faster_whisper import WhisperModel
 
 # Import WhisperX alignment tools
 from whisperx_utils.alignment import align, load_align_model
@@ -33,6 +35,47 @@ from whisperx_utils.schema import AlignedTranscriptionResult
 from whisperx_utils.audio import load_audio
 
 from subtitle_formatter import Subtitle
+
+_ALIGN_MODEL_CACHE = {}
+
+
+def _load_align_model_from_cache(language: str, device: str):
+    cache_key = f"{device}::{language}"
+    if cache_key not in _ALIGN_MODEL_CACHE:
+        align_model, align_metadata = load_align_model(language, device)
+        _ALIGN_MODEL_CACHE[cache_key] = (align_model, align_metadata)
+    return _ALIGN_MODEL_CACHE[cache_key]
+
+
+def _align_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    idx = payload["idx"]
+    chunk_path = payload["chunk_path"]
+    segments = payload["segments"]
+    language = payload["language"]
+    device = payload["device"]
+    interpolate_method = payload["interpolate_method"]
+
+    try:
+        audio = load_audio(chunk_path)
+        align_model, align_metadata = _load_align_model_from_cache(language, device)
+        aligned_data: AlignedTranscriptionResult = align(
+            segments,
+            align_model,
+            align_metadata,
+            audio,
+            device,
+            interpolate_method=interpolate_method,
+            return_char_alignments=False,
+            print_progress=False,
+        )
+        return {
+            "idx": idx,
+            "segments": aligned_data["segments"],
+            "word_segments": aligned_data.get("word_segments", []),
+            "error": "",
+        }
+    except Exception as e:
+        return {"idx": idx, "segments": None, "word_segments": None, "error": str(e)}
 
 def is_eng_or_num(s: str) -> bool:
     """Matches English letters, numbers, and basic word symbols like apostrophe."""
@@ -177,7 +220,7 @@ class AudioProcessor:
         return deduped
 
 
-    def process(self, file_paths: List[str]) -> List[AudioChunk]:
+    def process(self, file_paths: List[str], language: str = "zh") -> List[AudioChunk]:
         file_paths = self.process_input_paths(file_paths)
         if not file_paths:
             print("❌ [Error] No valid audio or video files found. Exiting.")
@@ -187,6 +230,7 @@ class AudioProcessor:
 
         print(f"🎵 [AudioProcessor] Splitting {len(file_paths)} files into ~{self.chunk_duration}s chunks (overlap={self.overlap}s)...")
         chunks = []
+        have_check_language = False
         for file_path in file_paths:
             duration = self._get_duration(file_path)
             base_name = Path(file_path).stem
@@ -216,7 +260,15 @@ class AudioProcessor:
                     chunk_path
                 ]
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                
+                if not have_check_language:
+                    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+                    # 只读取音频的前 30 秒进行语种检测
+                    segments, info = model.transcribe(chunk_path, beam_size=5)
+                    print(f"检测语种: {info.language} (置信度: {info.language_probability:.2f})")
+                    if language != info.language:
+                        assert False, f"⚠️ [AudioProcessor] 语种检测结果与指定语种不一致，请重新指定语言。"
+                    have_check_language = True
+
                 chunks.append(AudioChunk(
                     original_file=file_path,
                     chunk_path=chunk_path,
@@ -355,7 +407,7 @@ class ASRClient:
 
 class ASRCleaner:
     """Cleans and standardizes ASR results."""
-    def process(self, results: List[ASRResult]) -> List[ASRResult]:
+    def process(self, results: List[ASRResult], language: str) -> List[ASRResult]:
         print(f"🧹 [ASRCleaner] Cleaning raw API responses...")
         for res in results:
             raw_text = res.raw_response.strip()
@@ -377,17 +429,15 @@ class ASRCleaner:
                 data = []
 
             cleaned_segments = []
-            detected_languages = []
             for item in data:
                 # Convert keys to WhisperX expected format
                 start = float(item.get("Start time", item.get("Start", item.get("start", 0.0))))
                 end = float(item.get("End time", item.get("End", item.get("end", 0.0))))
-                text = item.get("Content", item.get("text", "")).strip()
-                lang = item.get("Language", item.get("language", "zh")).lower()
+                text = item.get("Content", item.get("text", "")).strip().lstrip(" ,.?!，。？！|、")
                 speaker = item.get("Speaker ID", item.get("Speaker", item.get("speaker", 0)))
                 
                 # Remove empty texts or pure silence tags
-                if not text or text.lower() == "[silence]" or text.lower() == "[music]" or text.lower() == "[human sounds]" or text.lower() == "[environmental sounds]":
+                if not text or text.lower() in ["[silence]", "[music]", "[human sounds]", "[environmental sounds]"]:
                     continue
                     
                 cleaned_segments.append({
@@ -396,13 +446,9 @@ class ASRCleaner:
                     "text": text,
                     "speaker": speaker
                 })
-                detected_languages.append(lang)
-            
-            res.segments = cleaned_segments
-            if detected_languages:
-                # Majority vote for chunk language
-                res.language = max(set(detected_languages), key=detected_languages.count)
                 
+            res.segments = cleaned_segments
+            res.language = language
         print(f"✅ [ASRCleaner] Cleaned {len(results)} chunks.")
         return results
 
@@ -563,64 +609,82 @@ class ResultMerger:
 
 class WhisperXAligner:
     """Performs word-level alignment using WhisperX on audio chunks."""
-    def __init__(self, device: str = "cpu", interpolate_method: str = "nearest"):
+    def __init__(self, device: str = "cpu", interpolate_method: str = "nearest", max_concurrent_align: int = 1):
         self.device = device
         self.interpolate_method = interpolate_method
-        self.align_model = None
-        self.current_language = None
-        self.align_metadata = None
+        self.max_concurrent_align = max(1, max_concurrent_align)
 
-    def _load_model(self, language: str):
-        if self.current_language != language or self.align_model is None:
-            print(f"🔄 [WhisperXAligner] Loading alignment model for language: {language} on {self.device}...")
-            self.align_model, self.align_metadata = load_align_model(
-                language, self.device
+    # 多进程传递的对象必须为可序列化对象，所以这里存在一个和 _align_worker 重复的路径
+    def _align_single_result(self, res: ASRResult) -> ASRResult:
+        if not res.segments:
+            return res
+
+        try:
+            audio = load_audio(res.chunk.chunk_path)
+        except Exception as e:
+            print(f"  ❌ Failed to load audio for chunk {res.chunk.chunk_path}: {e}")
+            return res
+
+        try:
+            align_model, align_metadata = _load_align_model_from_cache(res.language, self.device)
+        except Exception as e:
+            print(f"  ❌ Failed to load align model for language {res.language}: {e}")
+            return res
+
+        try:
+            aligned_data: AlignedTranscriptionResult = align(
+                res.segments,
+                align_model,
+                align_metadata,
+                audio,
+                self.device,
+                interpolate_method=self.interpolate_method,
+                return_char_alignments=False,
+                print_progress=False,
             )
-            self.current_language = language
+            res.segments = aligned_data["segments"]
+            res.word_segments = aligned_data.get("word_segments", [])
+        except Exception as e:
+            print(f"  ❌ Alignment failed for chunk {res.chunk.chunk_path}: {e}")
+
+        return res
 
     def process(self, asr_results: List[ASRResult]) -> List[ASRResult]:
-        print(f"🎯 [WhisperXAligner] Starting word-level alignment for {len(asr_results)} chunks...")
-        
-        for res in asr_results:
-            # Skip if no segments
-            if not res.segments:
-                continue
+        print(
+            f"🎯 [WhisperXAligner] Starting word-level alignment for {len(asr_results)} chunks "
+            f"(align_concurrency={self.max_concurrent_align})..."
+        )
 
-            # Load chunk audio
-            try:
-                audio = load_audio(res.chunk.chunk_path)
-            except Exception as e:
-                print(f"  ❌ Failed to load audio for chunk {res.chunk.chunk_path}: {e}")
-                continue
+        if self.max_concurrent_align <= 1 or len(asr_results) <= 1 or len(asr_results) < self.max_concurrent_align:
+            for res in asr_results:
+                self._align_single_result(res)
+        else:
+            tasks = []
+            for idx, res in enumerate(asr_results):
+                if not res.segments:
+                    continue
+                tasks.append({
+                    "idx": idx,
+                    "chunk_path": res.chunk.chunk_path,
+                    "segments": res.segments,
+                    "language": res.language,
+                    "device": self.device,
+                    "interpolate_method": self.interpolate_method,
+                })
 
-            # Load the correct model for the language
-            try:
-                self._load_model(res.language)
-            except Exception as e:
-                print(f"  ❌ Failed to load align model for language {res.language}: {e}")
-                continue
-            
-            # Perform alignment
-            try:
-                aligned_data: AlignedTranscriptionResult = align(
-                    res.segments,
-                    self.align_model,
-                    self.align_metadata,
-                    audio,
-                    self.device,
-                    interpolate_method=self.interpolate_method,
-                    return_char_alignments=False,
-                    print_progress=False,
-                )
-                
-                # Update the result with aligned segments and words in-place
-                res.segments = aligned_data["segments"]
-                res.word_segments = aligned_data.get("word_segments", [])
-                
-            except Exception as e:
-                print(f"  ❌ Alignment failed for chunk {res.chunk.chunk_path}: {e}")
-                # Keep original segments, word_segments remains empty
-                
+            if tasks:
+                with ProcessPoolExecutor(
+                    max_workers=self.max_concurrent_align,
+                    mp_context=mp.get_context("spawn"),
+                ) as executor:
+                    for output in executor.map(_align_worker, tasks):
+                        idx = output["idx"]
+                        if output["error"]:
+                            print(f"  ❌ Alignment failed for chunk {asr_results[idx].chunk.chunk_path}: {output['error']}")
+                            continue
+                        asr_results[idx].segments = output["segments"]
+                        asr_results[idx].word_segments = output["word_segments"]
+
         print(f"✅ [WhisperXAligner] Alignment complete for all chunks.")
         return asr_results
 
@@ -777,35 +841,38 @@ class PostProcessor:
         # 刷新word_segments
         # 处理没有时间戳的word
         for res in asr_results:
-            for seg in res.segments:
-                words = seg.get("words", [])
-                prev_word = {"end": 0.0}
-                char_time = 0
-                char_leng = 1e-7
-                for idx, word in enumerate(words):
-                    if word.get("start") == None:
-                        next_idx = idx + 1
-                        while (
-                            next_idx < len(words)
-                            and words[next_idx].get("start") == None
-                        ):
-                            next_idx += 1
-                        next_idx = min(next_idx, len(words) - 1)
-                        next_time = words[next_idx].get("start", seg.get("end", 1e16))
-                        if prev_word["end"] == next_time:
-                            prev_word["end"] = prev_word["end"] - (
-                                min(1, prev_word["end"] - prev_word["start"]) * 0.99
-                            )
+            try:
+                for seg in res.segments:
+                    words = seg.get("words", [])
+                    prev_word = {"end": 0.0}
+                    char_time = 0
+                    char_leng = 1e-7
+                    for idx, word in enumerate(words):
+                        if word.get("start") == None:
+                            next_idx = idx + 1
+                            while (
+                                next_idx < len(words)
+                                and words[next_idx].get("start") == None
+                            ):
+                                next_idx += 1
+                            next_idx = min(next_idx, len(words) - 1)
+                            next_time = words[next_idx].get("start", seg.get("end", 1e16))
+                            if prev_word["end"] == next_time:
+                                prev_word["end"] = prev_word["end"] - (
+                                    min(1, prev_word["end"] - prev_word["start"]) * 0.99
+                                )
 
-                        unit_time = char_time / char_leng
-                        word["start"] = prev_word["end"]
-                        word["end"] = min(
-                            next_time, word["start"] + unit_time * len(word["word"])
-                        )
-                        word["score"] = 0.49
-                    char_time += word["end"] - word["start"]
-                    char_leng += len(word["word"])
-                    prev_word = word
+                            unit_time = char_time / char_leng
+                            word["start"] = prev_word["end"]
+                            word["end"] = min(
+                                next_time, word["start"] + unit_time * len(word["word"])
+                            )
+                            word["score"] = 0.49
+                        char_time += word["end"] - word["start"]
+                        char_leng += len(word["word"])
+                        prev_word = word
+            except Exception as e:
+                assert False, f"Error processing segment: {e}, seg: {seg}"
 
         for res in asr_results:
             res.word_segments = []
@@ -901,6 +968,7 @@ def run_pipeline(
     overlap: int = 20,
     max_concurrent: int = 5,
     device: str = "cpu",
+    align_concurrency: int = 1,
     json_output: str = "json_output",
     srt_output: str = "srt_output",
     language: str = "zh"
@@ -918,7 +986,7 @@ def run_pipeline(
     # 1. Chunking
     t0 = time.time()
     processor = AudioProcessor(chunk_duration=chunk_duration, overlap=overlap)
-    chunks = processor.process(file_paths)
+    chunks = processor.process(file_paths, language=language)
     record_time("1. Audio Chunking", t0)
     
     # 2. ASR API Requests
@@ -930,13 +998,13 @@ def run_pipeline(
     # 3. Clean API Outputs
     t0 = time.time()
     cleaner = ASRCleaner()
-    cleaned_results = cleaner.process(raw_results)
+    cleaned_results = cleaner.process(raw_results, language=language)
     record_time("3. Clean API Outputs", t0)
     
     # 这里可以做标点符号校准    
     # 4. WhisperX Alignment (on Chunks)
     t0 = time.time()
-    aligner = WhisperXAligner(device=device)
+    aligner = WhisperXAligner(device=device, max_concurrent_align=align_concurrency)
     aligned_chunks = aligner.process(cleaned_results)
     record_time("4. WhisperX Alignment", t0)
     
@@ -946,7 +1014,7 @@ def run_pipeline(
     aligned_clean_chunks = post_processor.process(aligned_chunks, stage="clean_words")
     record_time("4.5 Clean Word Alignments", t0)
     
-    # 5. Merge Results
+    # 5. Merge Results, VibeVoice做speaker区分并不优秀，还是需要使用whisperx。
     t0 = time.time()
     merger = ResultMerger()
     merged_results = merger.process(aligned_clean_chunks)
@@ -985,6 +1053,7 @@ def main():
     parser.add_argument("--overlap", type=int, default=20, help="Overlap between chunks in seconds")
     parser.add_argument("--concurrency", type=int, default=5, help="Max concurrent API requests")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4"], help="Device for WhisperX alignment")
+    parser.add_argument("--align_concurrency", type=int, default=1, help="Max concurrent WhisperX alignment workers")
     parser.add_argument("--json_output", default="json_output", help="Directory to save JSON files")
     parser.add_argument("--srt_output", default="srt_output", help="Directory to save SRT files")
     parser.add_argument("--language", default="zh", help="Language for ASR")
@@ -998,6 +1067,7 @@ def main():
         overlap=args.overlap,
         max_concurrent=args.concurrency,
         device=args.device,
+        align_concurrency=args.align_concurrency,
         json_output=args.json_output,
         srt_output=args.srt_output,
         language=args.language
